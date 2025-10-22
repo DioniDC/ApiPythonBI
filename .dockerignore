@@ -1,0 +1,16 @@
+# Git
+.git
+.gitignore
+
+# Python caches / venv
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local env / configs
+.env
+*.log
+
+tests/
+docs/

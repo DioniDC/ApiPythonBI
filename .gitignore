@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.log
+.env
+.venv/
+venv/
+.envrc
+
+# Editor/OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Build/Dist
+build/
+dist/
+*.egg-info/
+
+# Docker
+*.pid

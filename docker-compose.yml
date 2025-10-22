@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  sgbi-api:
+    image: dionidias/sgbi-api:2.0.0
+    container_name: sgbi-api
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"  # usa o .env do Compose
+    restart: unless-stopped
+    environment:
+      API_TOKEN: ${API_TOKEN}
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-8}
+      DEFAULT_FILIAL: ${DEFAULT_FILIAL:-1}
