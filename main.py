@@ -272,10 +272,10 @@ def _cfg_dim(dim: str) -> _DimCfg:
         )
 
     if dim == "produto":
-        # pega descrição do produto
+        # pega descrição do produto e unidade de medida
         return _DimCfg(
             group="l.codigo",
-            select_dim="l.codigo AS chave, MAX(p.descricao) AS rotulo",
+            select_dim="l.codigo AS chave, MAX(p.descricao) AS rotulo, MAX(p.unidadeMedida) AS unidadeMedida",
             joins="LEFT JOIN view_produtos p ON p.codigo=l.codigo AND p.filial=l.filial",
         )
 
@@ -288,16 +288,11 @@ def _cfg_dim(dim: str) -> _DimCfg:
         )
 
     if dim == "vendedor":
-        # se tiver tabela/visão de vendedores, ajuste aqui:
-        # return _DimCfg(
-        #     group="l.vendedor",
-        #     select_dim="l.vendedor AS chave, MAX(v.nome) AS rotulo",
-        #     joins="LEFT JOIN view_vendedores v ON v.codigo=l.vendedor",
-        # )
+        # pega descrição do vendedor
         return _DimCfg(
             group="l.vendedor",
-            select_dim="l.vendedor AS chave",
-            joins="",
+            select_dim="l.vendedor AS chave, MAX(v.descricao) AS rotulo",
+            joins="LEFT JOIN view_11_vendedores v ON v.codigo=l.vendedor",
         )
 
     if dim == "departamento":
@@ -384,6 +379,9 @@ def _vendas_periodo_grouped(
         sql += " LIMIT %s OFFSET %s"
         params_tail = tuple([*params, limit, offset])
 
+    # Log da query executada
+    logger.info(f"📊 VENDAS/{dim.upper()} - SQL: {sql} | PARAMS: {params_tail}")
+
     with conn.cursor() as cur:
         cur.execute(sql, params_tail)
         data = rows_to_dicts(cur)
@@ -408,7 +406,7 @@ def _vendas_periodo_grouped(
 def vendas_resumo_diario(
     periodo: Periodo = Depends(),
     filial: int = Query(DEFAULT_FILIAL),
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     conn=Depends(get_conn),
 ):
@@ -468,7 +466,7 @@ def produtos_sem_venda_e_com_estoque(
     periodo: Periodo = Depends(),
     filial: int = Query(DEFAULT_FILIAL),
     estoque: float = Query(0.0, description="Estoque mínimo (usa filtro estrito: estoqueAtual > estoque)"),
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     conn=Depends(get_conn),
 ):
@@ -510,7 +508,7 @@ def produtos_sem_venda_e_com_estoque(
 def produtos_estoque_abaixo_minimo(
     filial: int = Query(DEFAULT_FILIAL),
     departamento: Optional[str] = Query(None, description="Código do departamento (opcional)"),
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     conn=Depends(get_conn),
 ):
@@ -711,7 +709,7 @@ def vendas_periodo_dia(
     filial: int = Query(DEFAULT_FILIAL),
     codigo: Optional[str] = Query(None, description="Filtra por data exata (YYYY-MM-DD)"),
     top: Optional[int] = Query(None, ge=1, le=1000, description="Ranking por venda"),
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     conn=Depends(get_conn),
 ):
@@ -723,7 +721,7 @@ def vendas_periodo_produto(
     filial: int = Query(DEFAULT_FILIAL),
     codigo: Optional[str] = Query(None, description="Código do produto"),
     top: Optional[int] = Query(None, ge=1, le=1000),
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     conn=Depends(get_conn),
 ):
@@ -735,7 +733,7 @@ def vendas_periodo_cliente(
     filial: int = Query(DEFAULT_FILIAL),
     codigo: Optional[str] = Query(None, description="Código do cliente (> 0)"),
     top: Optional[int] = Query(None, ge=1, le=1000),
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     conn=Depends(get_conn),
 ):
@@ -747,7 +745,7 @@ def vendas_periodo_vendedor(
     filial: int = Query(DEFAULT_FILIAL),
     codigo: Optional[str] = Query(None, description="Código do vendedor"),
     top: Optional[int] = Query(None, ge=1, le=1000),
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     conn=Depends(get_conn),
 ):
@@ -759,7 +757,7 @@ def vendas_periodo_departamento(
     filial: int = Query(DEFAULT_FILIAL),
     codigo: Optional[str] = Query(None, description="Código do departamento"),
     top: Optional[int] = Query(None, ge=1, le=1000),
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     conn=Depends(get_conn),
 ):
@@ -771,7 +769,7 @@ def vendas_periodo_grupo(
     filial: int = Query(DEFAULT_FILIAL),
     codigo: Optional[str] = Query(None, description="Código do grupo"),
     top: Optional[int] = Query(None, ge=1, le=1000),
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     conn=Depends(get_conn),
 ):
@@ -783,7 +781,7 @@ def vendas_periodo_subgrupo(
     filial: int = Query(DEFAULT_FILIAL),
     codigo: Optional[str] = Query(None, description="Código do subgrupo"),
     top: Optional[int] = Query(None, ge=1, le=1000),
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     conn=Depends(get_conn),
 ):
@@ -795,7 +793,7 @@ def produtos_sem_movimento(
         filial: int = Query(DEFAULT_FILIAL),
         dias: int = Query(30, ge=1, le=365, description="Dias sem venda"),
         departamento: Optional[int] = Query(None, description="Filtrar por departamento (opcional)"),
-        limit: int = Query(20, ge=1, le=1000),
+        limit: int = Query(50, ge=1, le=1000),
         offset: int = Query(0, ge=0),
         conn=Depends(get_conn),
 ):
@@ -875,7 +873,7 @@ def produtos_rotacao_lenta(
     filial: int = Query(DEFAULT_FILIAL),
     venda_media_max: float = Query(0.05, ge=0.0, description="vendaMediaDiaria ≤ X"),
     estoque_min: float = Query(1.0, ge=0.0, description="estoqueAtual ≥ min"),
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     conn=Depends(get_conn),
 ):
@@ -927,6 +925,7 @@ def busca_produto(
         "       custoMedio, lucroSobreVenda "
         "FROM view_produtos "
         "WHERE filial=%s AND UPPER(descricao) LIKE %s "
+        "  AND UPPER(descricao) NOT LIKE 'ZZ%%' "
         "ORDER BY descricao "
         "LIMIT %s OFFSET %s"
     )
@@ -1015,24 +1014,70 @@ def busca_subgrupo(
         limit, offset
     )
 
+@app.get("/busca/vendedor", response_model=PagedResponse, tags=["Busca"])
+def busca_vendedor(
+    nome: str = Query(..., min_length=2, description="Descrição do vendedor (LIKE)"),
+    limit: int = Query(50, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    conn=Depends(get_conn),
+):
+    like_pattern = f"%{nome.strip().upper()}%"
+    qcount = (
+        "SELECT COUNT(*) FROM view_11_vendedores "
+        "WHERE UPPER(descricao) LIKE %s"
+    )
+    qdata = (
+        "SELECT codigo, descricao "
+        "FROM view_11_vendedores "
+        "WHERE UPPER(descricao) LIKE %s "
+        "ORDER BY descricao "
+        "LIMIT %s OFFSET %s"
+    )
+    return run_count_and_data(
+        conn, qcount, qdata,
+        (like_pattern,),
+        (like_pattern, limit, offset),
+        limit, offset
+    )
+
 # ======================== CLIENTES ========================
-@app.get("/clientes/novos", tags=["Clientes"])  # igual à sua, mas via Periodo
-def clientes_novos(periodo: Periodo = Depends(), conn=Depends(get_conn)):
+@app.get("/clientes/novos", response_model=PagedResponse, tags=["Clientes"])
+def clientes_novos(
+    periodo: Periodo = Depends(),
+    limit: int = Query(50, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    conn=Depends(get_conn),
+):
     if not (periodo.data_ini and periodo.data_fim):
         raise HTTPException(status_code=400, detail="Informe data_ini e data_fim")
-    sql = (
-        "SELECT COUNT(*) AS novos_clientes FROM view_17_clientes_geocode WHERE dataCadastro BETWEEN %s AND %s"
+    
+    qcount = (
+        "SELECT COUNT(*) FROM view_17_clientes_geocode WHERE dataCadastro BETWEEN %s AND %s"
     )
-    with conn.cursor() as cur:
-        cur.execute(sql, (periodo.data_ini, periodo.data_fim))
-        return rows_to_dicts(cur)
+    qdata = (
+        "SELECT codigo, TRIM(razaoSocial) AS razaoSocial, dataCadastro "
+        "FROM view_17_clientes_geocode "
+        "WHERE dataCadastro BETWEEN %s AND %s "
+        "ORDER BY dataCadastro DESC "
+        "LIMIT %s OFFSET %s"
+    )
+    
+    return run_count_and_data(
+        conn,
+        qcount,
+        qdata,
+        (periodo.data_ini, periodo.data_fim),
+        (periodo.data_ini, periodo.data_fim, limit, offset),
+        limit,
+        offset,
+    )
 
 
 @app.get("/clientes/inativos", response_model=PagedResponse, tags=["Clientes"])  # novo
 def clientes_inativos(
     periodo: Periodo = Depends(),
     dias_sem_compra: Optional[int] = Query(None, ge=1),
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     conn=Depends(get_conn),
 ):
