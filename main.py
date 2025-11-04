@@ -257,149 +257,7 @@ def run_count_and_data(conn, qcount: str, qdata: str, pcount: Tuple[Any, ...], p
         data = rows_to_dicts(cur)
     return PagedResponse(page=Page(**paginate(total, limit, offset)), data=data)
 
-# ===== Helper para rotas /vendas/periodo por dimensão =====
 
-class _DimCfg(BaseModel):
-    group: Optional[str] = None
-    select_dim: Optional[str] = None
-    joins: str = ""
-
-def _cfg_dim(dim: str) -> _DimCfg:
-    if dim == "dia":
-        return _DimCfg(
-            group="DATE(l.dataVenda)",
-            select_dim="DATE(l.dataVenda) AS chave"
-        )
-
-    if dim == "produto":
-        # pega descrição do produto e unidade de medida
-        return _DimCfg(
-            group="l.codigo",
-            select_dim="l.codigo AS chave, MAX(p.descricao) AS rotulo, MAX(p.unidadeMedida) AS unidadeMedida",
-            joins="LEFT JOIN view_produtos p ON p.codigo=l.codigo AND p.filial=l.filial",
-        )
-
-    if dim == "cliente":
-        # pega nome/razão do cliente
-        return _DimCfg(
-            group="l.codigoCliente",
-            select_dim="l.codigoCliente AS chave, MAX(c.razaoSocial) AS rotulo",
-            joins="LEFT JOIN view_17_clientes_geocode c ON c.codigo=l.codigoCliente",
-        )
-
-    if dim == "vendedor":
-        # pega descrição do vendedor
-        return _DimCfg(
-            group="l.vendedor",
-            select_dim="l.vendedor AS chave, MAX(v.descricao) AS rotulo",
-            joins="LEFT JOIN view_11_vendedores v ON v.codigo=l.vendedor",
-        )
-
-    if dim == "departamento":
-        # pega descrição do departamento
-        return _DimCfg(
-            group="l.departamento",
-            select_dim="l.departamento AS chave, MAX(d.descricao) AS rotulo",
-            joins="LEFT JOIN view_11_departamentos d ON d.codigo=l.departamento",
-        )
-
-    if dim == "grupo":
-        # pega descrição do grupo (via produtos -> grupos)
-        return _DimCfg(
-            group="p.grupo",
-            select_dim="p.grupo AS chave, MAX(g.descricao) AS rotulo",
-            joins=(
-                "LEFT JOIN view_produtos p ON p.codigo=l.codigo AND p.filial=l.filial "
-                "LEFT JOIN view_11_grupos g ON g.codigo=p.grupo"
-            ),
-        )
-
-    if dim == "subgrupo":
-        # pega descrição do subgrupo (via produtos -> subgrupos)
-        return _DimCfg(
-            group="p.subgrupo",
-            select_dim="p.subgrupo AS chave, MAX(s.descricao) AS rotulo",
-            joins=(
-                "LEFT JOIN view_produtos p ON p.codigo=l.codigo AND p.filial=l.filial "
-                "LEFT JOIN view_11_subgrupos s ON s.codigo=p.subgrupo"
-            ),
-        )
-
-    raise HTTPException(status_code=400, detail="Dimensão inválida")
-
-def _vendas_periodo_grouped(
-    dim: str,
-    periodo: Periodo,
-    filial: int,
-    codigo: Optional[str],
-    top: Optional[int],
-    limit: int,
-    offset: int,
-    conn,
-) -> PagedResponse:
-    if not (periodo.data_ini and periodo.data_fim):
-        raise HTTPException(status_code=400, detail="Informe data_ini e data_fim")
-
-    cfg = _cfg_dim(dim)
-    where = ["l.filial=%s", "l.dataVenda BETWEEN %s AND %s", "l.cupomCancelado=''"]
-    params: List[Any] = [filial, periodo.data_ini, periodo.data_fim]
-
-    if dim == "cliente":
-        where.append("l.codigoCliente > 0")
-
-    if codigo:
-        campo = cfg.select_dim.split(" AS ")[0] if cfg.select_dim else None
-        if not campo:
-            raise HTTPException(status_code=400, detail="Dimensão sem campo de filtro")
-        where.append(f"{campo}=%s")
-        params.append(codigo)
-
-    w = " AND ".join(where)
-
-    base_select = (
-        f"SELECT {cfg.select_dim}, "
-        f"ROUND(SUM(l.valorTotal),2) AS venda, "
-        f"SUM(l.quantidadeVendida) AS itens, "
-        f"COUNT(DISTINCT CONCAT(l.numeroCaixa,'-',l.numeroCupom,'-',DATE(l.dataVenda))) AS cupons "
-        f"FROM logpdv l {cfg.joins} "
-        f"WHERE {w} "
-        f"GROUP BY {cfg.group} "
-        f"ORDER BY venda DESC"
-    )
-
-    sql = base_select
-    params_tail: Tuple[Any, ...] = tuple(params)
-
-    if codigo:
-        sql += " LIMIT 1"
-    elif top is not None:
-        sql += " LIMIT %s"
-        params_tail = tuple([*params, top])
-    else:
-        sql += " LIMIT %s OFFSET %s"
-        params_tail = tuple([*params, limit, offset])
-
-    # Log da query executada
-    logger.info(f"📊 VENDAS/{dim.upper()} - SQL: {sql} | PARAMS: {params_tail}")
-
-    with conn.cursor() as cur:
-        cur.execute(sql, params_tail)
-        data = rows_to_dicts(cur)
-
-    if codigo or top is not None:
-        total = len(data)
-        page = Page(total=total, limit=total or 1, offset=0, pages=1)
-        return PagedResponse(page=page, data=data)
-
-    with conn.cursor() as cur:
-        cur.execute(
-            f"SELECT COUNT(*) FROM (SELECT {cfg.group} "
-            f"FROM logpdv l {cfg.joins} WHERE {w} GROUP BY {cfg.group}) t",
-            tuple(params),
-        )
-        total = (cur.fetchone() or [0])[0] or 0
-
-    return PagedResponse(page=Page(**paginate(total, limit, offset)), data=data)
 
 # ======================== VENDAS ========================
 @app.get("/vendas/resumo-diario", response_model=PagedResponse, tags=["Vendas"])
@@ -412,37 +270,84 @@ def vendas_resumo_diario(
 ):
     if not (periodo.data_ini and periodo.data_fim):
         raise HTTPException(status_code=400, detail="Informe data_ini e data_fim")
+    
     qcount = (
-        "SELECT COUNT(*) FROM ( SELECT DATE(v.data) AS d FROM view_vendia v "
-        "WHERE v.filial=%s AND v.data BETWEEN %s AND %s GROUP BY DATE(v.data) ) t"
+        "SELECT COUNT(*) FROM ( "
+        "  SELECT DATE(t.data) AS d "
+        "  FROM view_analise_gerencial_produtos t "
+        "  WHERE t.filial=%s AND t.data BETWEEN %s AND %s "
+        "  GROUP BY DATE(t.data) "
+        ") sub"
     )
+    
     qdata = (
-        "SELECT DATE(v.data) AS data, COUNT(DISTINCT v.produto) AS produtos_distintos, "
-        "SUM(v.quantidade) AS itens, ROUND(SUM(v.valor_total),2) AS venda_bruta, "
-        "ROUND(SUM(v.lucro_bruto),2) AS lucro_bruto, ROUND(AVG(v.lucro_sobre_venda),2) AS margem_media "
-        "FROM view_vendia v WHERE v.filial=%s AND v.data BETWEEN %s AND %s "
-        "GROUP BY DATE(v.data) ORDER BY data LIMIT %s OFFSET %s"
+        "SELECT "
+        "  DATE(t.data) AS data, "
+        "  COUNT(DISTINCT t.codigo) AS produtos_distintos, "
+        "  ROUND(SUM(t.quantidadeVendas), 2) AS itens, "
+        "  ROUND(SUM(t.totalVenda), 2) AS venda_bruta, "
+        "  ROUND(SUM(t.totalVenda) - SUM(t.totalCusto), 2) AS lucro_bruto, "
+        "  ROUND(((SUM(t.totalVenda) - SUM(t.totalCusto)) / NULLIF(SUM(t.totalVenda), 0)) * 100, 2) AS margem_media "
+        "FROM view_analise_gerencial_produtos t "
+        "WHERE t.filial=%s AND t.data BETWEEN %s AND %s "
+        "GROUP BY DATE(t.data) "
+        "ORDER BY data "
+        "LIMIT %s OFFSET %s"
     )
-    return run_count_and_data(conn, qcount, qdata, (filial, periodo.data_ini, periodo.data_fim), (filial, periodo.data_ini, periodo.data_fim, limit, offset), limit, offset)
-
-
-@app.get("/vendas/resumo-filial", tags=["Vendas"])  # usa PARFIL
-def vendas_resumo_filial(
+    
+    return run_count_and_data(
+        conn, qcount, qdata, 
+        (filial, periodo.data_ini, periodo.data_fim), 
+        (filial, periodo.data_ini, periodo.data_fim, limit, offset), 
+        limit, offset
+    )
+    
+@app.get("/vendas/resumo-filial-periodo", tags=["Vendas"])
+def vendas_resumo_filial_periodo(
     periodo: Periodo = Depends(),
     filial: int = Query(DEFAULT_FILIAL),
     conn=Depends(get_conn),
 ):
+    """
+    Resumo consolidado de vendas da filial em um período (tipo SGBI).
+    Retorna indicadores: Vendas, Custos, Lucros, Quantidades, Participações, etc.
+    """
     if not (periodo.data_ini and periodo.data_fim):
         raise HTTPException(status_code=400, detail="Informe data_ini e data_fim")
+    
     sql = (
-        "SELECT p.filial, DATE(p.dataVenda) AS data, p.totvrvenda AS venda, p.totprodvda AS itens, "
-        "p.nclientes AS cupons, p.sku AS skus, p.totvrcusto AS custo "
-        "FROM parfil p WHERE p.filial=%s AND p.dataVenda BETWEEN %s AND %s ORDER BY data"
+        "SELECT "
+        "  T1.filial AS filial, "
+        "  COALESCE(SUM(T1.quantidadeClentes), 0) AS quantidadeClientes, "
+        "  COALESCE(ROUND(SUM(T1.totalVenda), 2), 0) AS vendas, "
+        "  COALESCE(ROUND(((SUM(T1.totalVenda) - SUM(T1.totalCusto)) / NULLIF(SUM(T1.totalVenda), 0)) * 100, 2), 0) AS lucroSobreVendaPerc, "
+        "  COALESCE(ROUND(((SUM(T1.totalVenda) - SUM(T1.totalCusto)) / NULLIF(SUM(T1.totalCusto), 0)) * 100, 2), 0) AS lucroCustoTotalPerc, "
+        "  COALESCE(ROUND(SUM(T1.quantidadeVendas), 2), 0) AS quantidadeVendida, "
+        "  COALESCE(ROUND(SUM(T1.quantidadeCompras), 2), 0) AS quantidadeComprada, "
+        "  COALESCE(ROUND(SUM(T1.totalVenda) / NULLIF(SUM(T1.quantidadeVendas), 0), 2), 0) AS precoMedioItem, "
+        "  COALESCE(ROUND((SUM(T1.totalVenda) * 100) / NULLIF((SELECT SUM(totalVenda) FROM view_analise_gerencial_produtos WHERE filial=%s AND data BETWEEN %s AND %s), 0), 2), 0) AS participacaoVendas, "
+        "  COALESCE(ROUND(SUM(T1.totalVenda) / NULLIF(SUM(T1.quantidadeClentes), 0), 2), 0) AS vendaMediaCliente, "
+        "  COALESCE(ROUND(SUM(T1.totalCusto) / NULLIF(SUM(T1.quantidadeVendas), 0), 2), 0) AS custoMedioItem, "
+        "  COALESCE(ROUND(SUM(T1.totalCusto), 2), 0) AS custoTotal, "
+        "  COALESCE(ROUND((SUM(T1.totalCusto) * 100) / NULLIF(SUM(T1.totalVenda), 0), 2), 0) AS cmvPerc, "
+        "  COALESCE(ROUND(SUM(T1.totalCompra), 2), 0) AS compras, "
+        "  COALESCE(ROUND((SUM(T1.totalCompra) * 100) / NULLIF(SUM(T1.totalVenda), 0), 2), 0) AS compraVendaPerc, "
+        "  COALESCE(ROUND(SUM(T1.totalTransferenciaEntrada), 2), 0) AS transferenciasEntrada, "
+        "  COALESCE(ROUND(SUM(T1.totalTransferenciaSaida), 2), 0) AS transferenciasSaida, "
+        "  COALESCE(ROUND(SUM(T1.totalPerdas), 2), 0) AS perdas, "
+        "  COALESCE(ROUND(SUM(T1.quantidadePerdas), 2), 0) AS quantidadePerdas, "
+        "  COALESCE(ROUND(SUM(T1.totalTrocas), 2), 0) AS trocas, "
+        "  COALESCE(ROUND(SUM(T1.quantidadeTrocas), 2), 0) AS quantidadeTrocas "
+        "FROM view_analise_gerencial_produtos AS T1 "
+        "WHERE T1.filial=%s AND T1.data BETWEEN %s AND %s "
+        "GROUP BY T1.filial"
     )
+    
     with conn.cursor() as cur:
-        cur.execute(sql, (filial, periodo.data_ini, periodo.data_fim))
-        return rows_to_dicts(cur)
-
+        cur.execute(sql, (filial, periodo.data_ini, periodo.data_fim, filial, periodo.data_ini, periodo.data_fim))
+        data = rows_to_dicts(cur)
+    
+    return data[0] if data else {}
 
 @app.get("/vendas/por-hora", tags=["Vendas"])  # mantém assinatura, mas via Periodo
 def vendas_por_hora(
@@ -537,33 +442,7 @@ def produtos_estoque_abaixo_minimo(
 
     return run_count_and_data(conn, qcount, qdata, tuple(pcount), tuple([*pdata, limit, offset]), limit, offset)
 
-# ROTA 1: /clientes/busca-nome (linha ~673)
-@app.get("/clientes/busca-nome", response_model=PagedResponse, tags=["Clientes"])
-def clientes_busca_nome(
-    nome: str = Query(..., min_length=2, description="Nome ou parte"),
-    limit: int = Query(50, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-    conn=Depends(get_conn),
-):
-    like = f"%{nome.strip()}%"
-    qcount = ("SELECT COUNT(*) FROM view_17_clientes_geocode "
-              "WHERE razaoSocial LIKE %s OR nomeFantasia LIKE %s")
-    qdata = (
-        "SELECT codigo, "
-        "razaoSocial AS nome, "  # <-- MUDANÇA AQUI
-        "nomeFantasia, "
-        "CONCAT(SUBSTRING(cpf,1,3),'.***.**-',SUBSTRING(cpf,-2)) AS cpf_mascarado, "
-        "telefone, celular, email, cidade, bairro, dataCadastro, dataUltimaCompra "
-        "FROM view_17_clientes_geocode "
-        "WHERE razaoSocial LIKE %s OR nomeFantasia LIKE %s "
-        "ORDER BY razaoSocial LIMIT %s OFFSET %s"
-    )
-    return run_count_and_data(conn, qcount, qdata,
-                              (like, like),
-                              (like, like, limit, offset),
-                              limit, offset)
-
-# ROTA 2: /busca/cliente (linha ~884) - JÁ ESTÁ CERTO!
+# ROTA: /busca/cliente - Busca unificada com todos os campos
 @app.get("/busca/cliente", response_model=PagedResponse, tags=["Busca"])
 def busca_cliente(
     nome: str = Query(..., min_length=2, description="Razão social (LIKE)"),
@@ -578,15 +457,17 @@ def busca_cliente(
         "   codigo, "
         "   TRIM(razaoSocial) AS nome, "
         "   TRIM(nomeFantasia) AS nomeFantasia, "
-        "   TRIM(cpf) AS cpf, "
+        "   CONCAT(SUBSTRING(cpf,1,3),'.***.**-',SUBSTRING(cpf,-2)) AS cpf_mascarado, "
         "   TRIM(telefone) AS telefone, "
+        "   TRIM(celular) AS celular, "
         "   TRIM(email) AS email, "
         "   TRIM(endereco) AS endereco, "
         "   TRIM(bairro)   AS bairro, "
         "   TRIM(cidade)   AS cidade, "
         "   TRIM(uf) AS uf, "
         "   TRIM(cep) AS cep, "
-        "   dataCadastro "
+        "   dataCadastro, "
+        "   dataUltimaCompra "
         " FROM view_17_clientes_geocode "
         " WHERE UPPER(TRIM(razaoSocial)) LIKE %s "
         " ORDER BY razaoSocial "
@@ -598,122 +479,85 @@ def busca_cliente(
         (like_pattern, limit, offset),
         limit, offset
     )
-# ===== NOVAS ROTAS: VENDAS POR DEPARTAMENTO / GRUPO / SUBGRUPO =====
-@app.get("/vendas/por-grupo", response_model=PagedResponse, tags=["Vendas"])
-def vendas_por_grupo(
-    periodo: Periodo = Depends(),
-    filial: int = Query(DEFAULT_FILIAL),
-    codigo: Optional[str] = Query(None, description="Se informado, filtra um grupo específico"),
-    limit: int = Query(50, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-    conn=Depends(get_conn),
-):
-    if not (periodo.data_ini and periodo.data_fim):
-        raise HTTPException(status_code=400, detail="Informe data_ini e data_fim")
 
-    where = ["l.filial=%s", "l.dataVenda BETWEEN %s AND %s", "l.cupomCancelado=''" ]
-    params_c: List[Any] = [filial, periodo.data_ini, periodo.data_fim]
-    params_d: List[Any] = [filial, periodo.data_ini, periodo.data_fim]
-
-    # JOIN com a tabela de grupos para pegar a descrição
-    join = """
-        JOIN view_produtos p ON p.codigo=l.codigo AND p.filial=l.filial
-        LEFT JOIN view_11_grupos g ON g.codigo=p.grupo
-    """
-
-    if codigo:
-        where.append("p.grupo=%s")
-        params_c.append(codigo)
-        params_d.append(codigo)
-
-    w = " AND ".join(where)
-
-    qcount = f"SELECT COUNT(*) FROM (SELECT p.grupo FROM logpdv l {join} WHERE {w} GROUP BY p.grupo) t"
-    qdata  = (
-        f"SELECT p.grupo AS codigo, "
-        f"MAX(g.descricao) AS descricao, "
-        f"ROUND(SUM(l.valorTotal),2) AS vendaTotal, "
-        f"SUM(l.quantidadeVendida) AS itensVendidos "
-        f"FROM logpdv l {join} WHERE {w} "
-        f"GROUP BY p.grupo "
-        f"ORDER BY vendaTotal DESC LIMIT %s OFFSET %s"
-    )
-    return run_count_and_data(conn, qcount, qdata, tuple(params_c), tuple([*params_d, limit, offset]), limit, offset)
-
-@app.get("/vendas/por-subgrupo", response_model=PagedResponse, tags=["Vendas"])
-def vendas_por_subgrupo(
-    periodo: Periodo = Depends(),
-    filial: int = Query(DEFAULT_FILIAL),
-    codigo: Optional[str] = Query(None, description="Se informado, filtra um subgrupo específico"),
-    limit: int = Query(50, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-    conn=Depends(get_conn),
-):
-    if not (periodo.data_ini and periodo.data_fim):
-        raise HTTPException(status_code=400, detail="Informe data_ini e data_fim")
-
-    where = ["l.filial=%s", "l.dataVenda BETWEEN %s AND %s", "l.cupomCancelado=''" ]
-    params_c: List[Any] = [filial, periodo.data_ini, periodo.data_fim]
-    params_d: List[Any] = [filial, periodo.data_ini, periodo.data_fim]
-
-    # JOIN com a tabela de subgrupos para pegar a descrição
-    join = """
-        JOIN view_produtos p ON p.codigo=l.codigo AND p.filial=l.filial
-        LEFT JOIN view_11_subgrupos s ON s.codigo=p.subgrupo
-    """
-
-    if codigo:
-        where.append("p.subgrupo=%s")
-        params_c.append(codigo)
-        params_d.append(codigo)
-
-    w = " AND ".join(where)
-
-    qcount = f"SELECT COUNT(*) FROM (SELECT p.subgrupo FROM logpdv l {join} WHERE {w} GROUP BY p.subgrupo) t"
-    qdata  = (
-        f"SELECT p.subgrupo AS codigo, "
-        f"MAX(s.descricao) AS descricao, "
-        f"ROUND(SUM(l.valorTotal),2) AS vendaTotal, "
-        f"SUM(l.quantidadeVendida) AS itensVendidos "
-        f"FROM logpdv l {join} WHERE {w} "
-        f"GROUP BY p.subgrupo "
-        f"ORDER BY vendaTotal DESC LIMIT %s OFFSET %s"
-    )
-    return run_count_and_data(conn, qcount, qdata, tuple(params_c), tuple([*params_d, limit, offset]), limit, offset)
 
 # ===== ROTAS DESMEMBRADAS: VENDAS POR PERÍODO (dimensões específicas) =====
-
-@app.get("/vendas/periodo/total", tags=["Vendas"])
-def vendas_periodo_total(
+@app.get("/vendas/periodo/departamento", response_model=PagedResponse, tags=["Vendas"])
+def vendas_periodo_departamento(
     periodo: Periodo = Depends(),
     filial: int = Query(DEFAULT_FILIAL),
+    codigo: Optional[str] = Query(None, description="Código do departamento"),
+    top: Optional[int] = Query(None, ge=1, le=1000),
+    limit: int = Query(50, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
     conn=Depends(get_conn),
 ):
     if not (periodo.data_ini and periodo.data_fim):
         raise HTTPException(status_code=400, detail="Informe data_ini e data_fim")
 
-    select_sql = (
-        "SELECT ROUND(SUM(l.valorTotal),2) AS venda, SUM(l.quantidadeVendida) AS itens, "
-        "COUNT(DISTINCT CONCAT(l.numeroCaixa,'-',l.numeroCupom,'-',DATE(l.dataVenda))) AS cupons "
-        "FROM logpdv l WHERE l.filial=%s AND l.dataVenda BETWEEN %s AND %s AND l.cupomCancelado=''"
-    )
-    with conn.cursor() as cur:
-        cur.execute(select_sql, (filial, periodo.data_ini, periodo.data_fim))
-        data = rows_to_dicts(cur)
-    # retorna objeto único (ou {} se vazio)
-    return data[0] if data else {}
+    where = ["t.filial=%s", "t.data BETWEEN %s AND %s"]
+    params_c: List[Any] = [filial, periodo.data_ini, periodo.data_fim]
+    params_d: List[Any] = [filial, periodo.data_ini, periodo.data_fim]
 
-@app.get("/vendas/periodo/dia", response_model=PagedResponse, tags=["Vendas"])
-def vendas_periodo_dia(
-    periodo: Periodo = Depends(),
-    filial: int = Query(DEFAULT_FILIAL),
-    codigo: Optional[str] = Query(None, description="Filtra por data exata (YYYY-MM-DD)"),
-    top: Optional[int] = Query(None, ge=1, le=1000, description="Ranking por venda"),
-    limit: int = Query(50, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-    conn=Depends(get_conn),
-):
-    return _vendas_periodo_grouped("dia", periodo, filial, codigo, top, limit, offset, conn)
+    if codigo:
+        where.append("t.departamento=%s")
+        params_c.append(codigo)
+        params_d.append(codigo)
+
+    w = " AND ".join(where)
+
+    # COUNT
+    qcount = (
+        f"SELECT COUNT(*) FROM ("
+        f"  SELECT t.departamento "
+        f"  FROM view_analise_gerencial_produtos t "
+        f"  WHERE {w} "
+        f"  GROUP BY t.departamento"
+        f") sub"
+    )
+
+    # DATA
+    qdata = (
+        f"SELECT "
+        f"  t.departamento AS chave, "
+        f"  MAX(d.descricao) AS rotulo, "
+        f"  ROUND(SUM(t.totalVenda), 2) AS venda, "
+        f"  ROUND(SUM(t.quantidadeVendas), 2) AS itens, "
+        f"  COUNT(DISTINCT t.codigo) AS produtos_distintos "
+        f"FROM view_analise_gerencial_produtos t "
+        f"LEFT JOIN view_11_departamentos d ON d.codigo=t.departamento "
+        f"WHERE {w} "
+        f"GROUP BY t.departamento "
+        f"ORDER BY venda DESC"
+    )
+
+    # Adiciona LIMIT conforme lógica
+    if codigo:
+        qdata += " LIMIT 1"
+        params_tail = tuple(params_d)
+    elif top is not None:
+        qdata += " LIMIT %s"
+        params_tail = tuple([*params_d, top])
+    else:
+        qdata += " LIMIT %s OFFSET %s"
+        params_tail = tuple([*params_d, limit, offset])
+
+    logger.info(f"📊 VENDAS/DEPARTAMENTO - SQL: {qdata} | PARAMS: {params_tail}")
+
+    with conn.cursor() as cur:
+        cur.execute(qdata, params_tail)
+        data = rows_to_dicts(cur)
+
+    if codigo or top is not None:
+        total = len(data)
+        page = Page(total=total, limit=total or 1, offset=0, pages=1)
+        return PagedResponse(page=page, data=data)
+
+    with conn.cursor() as cur:
+        cur.execute(qcount, tuple(params_c))
+        total = (cur.fetchone() or [0])[0] or 0
+
+    return PagedResponse(page=Page(**paginate(total, limit, offset)), data=data)
 
 @app.get("/vendas/periodo/produto", response_model=PagedResponse, tags=["Vendas"])
 def vendas_periodo_produto(
@@ -725,7 +569,71 @@ def vendas_periodo_produto(
     offset: int = Query(0, ge=0),
     conn=Depends(get_conn),
 ):
-    return _vendas_periodo_grouped("produto", periodo, filial, codigo, top, limit, offset, conn)
+    if not (periodo.data_ini and periodo.data_fim):
+        raise HTTPException(status_code=400, detail="Informe data_ini e data_fim")
+
+    where = ["t.filial=%s", "t.data BETWEEN %s AND %s"]
+    params_c: List[Any] = [filial, periodo.data_ini, periodo.data_fim]
+    params_d: List[Any] = [filial, periodo.data_ini, periodo.data_fim]
+
+    if codigo:
+        where.append("t.codigo=%s")
+        params_c.append(codigo)
+        params_d.append(codigo)
+
+    w = " AND ".join(where)
+    # COUNT
+    qcount = (
+        f"SELECT COUNT(*) FROM ("
+        f"  SELECT t.codigo "
+        f"  FROM view_analise_gerencial_produtos t "
+        f"  WHERE {w} "
+        f"  GROUP BY t.codigo"
+        f") sub"
+    )
+
+    # DATA
+    qdata = (
+        f"SELECT "
+        f"  t.codigo AS chave, "
+        f"  MAX(p.descricao) AS rotulo, "
+        f"  ROUND(SUM(t.totalVenda), 2) AS venda, "
+        f"  ROUND(SUM(t.quantidadeVendas), 2) AS itens, "
+        f"  MAX(p.unidadeMedida) AS unidadeMedida "
+        f"FROM view_analise_gerencial_produtos t "
+        f"LEFT JOIN view_produtos p ON p.codigo=t.codigo AND p.filial=t.filial "
+        f"WHERE {w} "
+        f"GROUP BY t.codigo "
+        f"ORDER BY venda DESC"
+    )
+
+    # Adiciona LIMIT conforme lógica
+    if codigo:
+        qdata += " LIMIT 1"
+        params_tail = tuple(params_d)
+    elif top is not None:
+        qdata += " LIMIT %s"
+        params_tail = tuple([*params_d, top])
+    else:
+        qdata += " LIMIT %s OFFSET %s"
+        params_tail = tuple([*params_d, limit, offset])
+
+    logger.info(f"📊 VENDAS/PRODUTO - SQL: {qdata} | PARAMS: {params_tail}")
+
+    with conn.cursor() as cur:
+        cur.execute(qdata, params_tail)
+        data = rows_to_dicts(cur)
+
+    if codigo or top is not None:
+        total = len(data)
+        page = Page(total=total, limit=total or 1, offset=0, pages=1)
+        return PagedResponse(page=page, data=data)
+
+    with conn.cursor() as cur:
+        cur.execute(qcount, tuple(params_c))
+        total = (cur.fetchone() or [0])[0] or 0
+
+    return PagedResponse(page=Page(**paginate(total, limit, offset)), data=data)
 
 @app.get("/vendas/periodo/cliente", response_model=PagedResponse, tags=["Vendas"])
 def vendas_periodo_cliente(
@@ -737,7 +645,72 @@ def vendas_periodo_cliente(
     offset: int = Query(0, ge=0),
     conn=Depends(get_conn),
 ):
-    return _vendas_periodo_grouped("cliente", periodo, filial, codigo, top, limit, offset, conn)
+    if not (periodo.data_ini and periodo.data_fim):
+        raise HTTPException(status_code=400, detail="Informe data_ini e data_fim")
+
+    where = ["t.filial=%s", "t.data BETWEEN %s AND %s", "t.codigoCliente > 0"]
+    params_c: List[Any] = [filial, periodo.data_ini, periodo.data_fim]
+    params_d: List[Any] = [filial, periodo.data_ini, periodo.data_fim]
+
+    if codigo:
+        where.append("t.codigoCliente=%s")
+        params_c.append(codigo)
+        params_d.append(codigo)
+
+    w = " AND ".join(where)
+
+    # COUNT
+    qcount = (
+        f"SELECT COUNT(*) FROM ("
+        f"  SELECT t.codigoCliente "
+        f"  FROM view_analise_gerencial_produtos t "
+        f"  WHERE {w} "
+        f"  GROUP BY t.codigoCliente"
+        f") sub"
+    )
+
+    # DATA
+    qdata = (
+        f"SELECT "
+        f"  t.codigoCliente AS chave, "
+        f"  MAX(c.razaoSocial) AS rotulo, "
+        f"  ROUND(SUM(t.totalVenda), 2) AS venda, "
+        f"  ROUND(SUM(t.quantidadeVendas), 2) AS itens, "
+        f"  COUNT(DISTINCT t.codigo) AS produtos_distintos "
+        f"FROM view_analise_gerencial_produtos t "
+        f"LEFT JOIN view_17_clientes_geocode c ON c.codigo=t.codigoCliente "
+        f"WHERE {w} "
+        f"GROUP BY t.codigoCliente "
+        f"ORDER BY venda DESC"
+    )
+
+    # Adiciona LIMIT conforme lógica
+    if codigo:
+        qdata += " LIMIT 1"
+        params_tail = tuple(params_d)
+    elif top is not None:
+        qdata += " LIMIT %s"
+        params_tail = tuple([*params_d, top])
+    else:
+        qdata += " LIMIT %s OFFSET %s"
+        params_tail = tuple([*params_d, limit, offset])
+
+    logger.info(f"📊 VENDAS/CLIENTE - SQL: {qdata} | PARAMS: {params_tail}")
+
+    with conn.cursor() as cur:
+        cur.execute(qdata, params_tail)
+        data = rows_to_dicts(cur)
+
+    if codigo or top is not None:
+        total = len(data)
+        page = Page(total=total, limit=total or 1, offset=0, pages=1)
+        return PagedResponse(page=page, data=data)
+
+    with conn.cursor() as cur:
+        cur.execute(qcount, tuple(params_c))
+        total = (cur.fetchone() or [0])[0] or 0
+
+    return PagedResponse(page=Page(**paginate(total, limit, offset)), data=data)
 
 @app.get("/vendas/periodo/vendedor", response_model=PagedResponse, tags=["Vendas"])
 def vendas_periodo_vendedor(
@@ -749,19 +722,72 @@ def vendas_periodo_vendedor(
     offset: int = Query(0, ge=0),
     conn=Depends(get_conn),
 ):
-    return _vendas_periodo_grouped("vendedor", periodo, filial, codigo, top, limit, offset, conn)
+    if not (periodo.data_ini and periodo.data_fim):
+        raise HTTPException(status_code=400, detail="Informe data_ini e data_fim")
 
-@app.get("/vendas/periodo/departamento", response_model=PagedResponse, tags=["Vendas"])
-def vendas_periodo_departamento(
-    periodo: Periodo = Depends(),
-    filial: int = Query(DEFAULT_FILIAL),
-    codigo: Optional[str] = Query(None, description="Código do departamento"),
-    top: Optional[int] = Query(None, ge=1, le=1000),
-    limit: int = Query(50, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-    conn=Depends(get_conn),
-):
-    return _vendas_periodo_grouped("departamento", periodo, filial, codigo, top, limit, offset, conn)
+    where = ["t.filial=%s", "t.data BETWEEN %s AND %s"]
+    params_c: List[Any] = [filial, periodo.data_ini, periodo.data_fim]
+    params_d: List[Any] = [filial, periodo.data_ini, periodo.data_fim]
+
+    if codigo:
+        where.append("t.vendedor=%s")
+        params_c.append(codigo)
+        params_d.append(codigo)
+
+    w = " AND ".join(where)
+
+    # COUNT
+    qcount = (
+        f"SELECT COUNT(*) FROM ("
+        f"  SELECT t.vendedor "
+        f"  FROM view_analise_gerencial_produtos t "
+        f"  WHERE {w} "
+        f"  GROUP BY t.vendedor"
+        f") sub"
+    )
+
+    # DATA
+    qdata = (
+        f"SELECT "
+        f"  t.vendedor AS chave, "
+        f"  MAX(v.descricao) AS rotulo, "
+        f"  ROUND(SUM(t.totalVenda), 2) AS venda, "
+        f"  ROUND(SUM(t.quantidadeVendas), 2) AS itens, "
+        f"  COUNT(DISTINCT t.codigo) AS produtos_distintos "
+        f"FROM view_analise_gerencial_produtos t "
+        f"LEFT JOIN view_11_vendedores v ON v.codigo=t.vendedor "
+        f"WHERE {w} "
+        f"GROUP BY t.vendedor "
+        f"ORDER BY venda DESC"
+    )
+
+    # Adiciona LIMIT conforme lógica
+    if codigo:
+        qdata += " LIMIT 1"
+        params_tail = tuple(params_d)
+    elif top is not None:
+        qdata += " LIMIT %s"
+        params_tail = tuple([*params_d, top])
+    else:
+        qdata += " LIMIT %s OFFSET %s"
+        params_tail = tuple([*params_d, limit, offset])
+
+    logger.info(f"📊 VENDAS/VENDEDOR - SQL: {qdata} | PARAMS: {params_tail}")
+
+    with conn.cursor() as cur:
+        cur.execute(qdata, params_tail)
+        data = rows_to_dicts(cur)
+
+    if codigo or top is not None:
+        total = len(data)
+        page = Page(total=total, limit=total or 1, offset=0, pages=1)
+        return PagedResponse(page=page, data=data)
+
+    with conn.cursor() as cur:
+        cur.execute(qcount, tuple(params_c))
+        total = (cur.fetchone() or [0])[0] or 0
+
+    return PagedResponse(page=Page(**paginate(total, limit, offset)), data=data)
 
 @app.get("/vendas/periodo/grupo", response_model=PagedResponse, tags=["Vendas"])
 def vendas_periodo_grupo(
@@ -773,7 +799,72 @@ def vendas_periodo_grupo(
     offset: int = Query(0, ge=0),
     conn=Depends(get_conn),
 ):
-    return _vendas_periodo_grouped("grupo", periodo, filial, codigo, top, limit, offset, conn)
+    if not (periodo.data_ini and periodo.data_fim):
+        raise HTTPException(status_code=400, detail="Informe data_ini e data_fim")
+
+    where = ["t.filial=%s", "t.data BETWEEN %s AND %s"]
+    params_c: List[Any] = [filial, periodo.data_ini, periodo.data_fim]
+    params_d: List[Any] = [filial, periodo.data_ini, periodo.data_fim]
+
+    if codigo:
+        where.append("t.grupo=%s")
+        params_c.append(codigo)
+        params_d.append(codigo)
+
+    w = " AND ".join(where)
+
+    # COUNT
+    qcount = (
+        f"SELECT COUNT(*) FROM ("
+        f"  SELECT t.grupo "
+        f"  FROM view_analise_gerencial_produtos t "
+        f"  WHERE {w} "
+        f"  GROUP BY t.grupo"
+        f") sub"
+    )
+
+    # DATA
+    qdata = (
+        f"SELECT "
+        f"  t.grupo AS chave, "
+        f"  MAX(g.descricao) AS rotulo, "
+        f"  ROUND(SUM(t.totalVenda), 2) AS venda, "
+        f"  ROUND(SUM(t.quantidadeVendas), 2) AS itens, "
+        f"  COUNT(DISTINCT t.codigo) AS produtos_distintos "
+        f"FROM view_analise_gerencial_produtos t "
+        f"LEFT JOIN view_11_grupos g ON g.codigo=t.grupo "
+        f"WHERE {w} "
+        f"GROUP BY t.grupo "
+        f"ORDER BY venda DESC"
+    )
+
+    # Adiciona LIMIT conforme lógica
+    if codigo:
+        qdata += " LIMIT 1"
+        params_tail = tuple(params_d)
+    elif top is not None:
+        qdata += " LIMIT %s"
+        params_tail = tuple([*params_d, top])
+    else:
+        qdata += " LIMIT %s OFFSET %s"
+        params_tail = tuple([*params_d, limit, offset])
+
+    logger.info(f"📊 VENDAS/GRUPO - SQL: {qdata} | PARAMS: {params_tail}")
+
+    with conn.cursor() as cur:
+        cur.execute(qdata, params_tail)
+        data = rows_to_dicts(cur)
+
+    if codigo or top is not None:
+        total = len(data)
+        page = Page(total=total, limit=total or 1, offset=0, pages=1)
+        return PagedResponse(page=page, data=data)
+
+    with conn.cursor() as cur:
+        cur.execute(qcount, tuple(params_c))
+        total = (cur.fetchone() or [0])[0] or 0
+
+    return PagedResponse(page=Page(**paginate(total, limit, offset)), data=data)
 
 @app.get("/vendas/periodo/subgrupo", response_model=PagedResponse, tags=["Vendas"])
 def vendas_periodo_subgrupo(
@@ -785,7 +876,72 @@ def vendas_periodo_subgrupo(
     offset: int = Query(0, ge=0),
     conn=Depends(get_conn),
 ):
-    return _vendas_periodo_grouped("subgrupo", periodo, filial, codigo, top, limit, offset, conn)
+    if not (periodo.data_ini and periodo.data_fim):
+        raise HTTPException(status_code=400, detail="Informe data_ini e data_fim")
+
+    where = ["t.filial=%s", "t.data BETWEEN %s AND %s"]
+    params_c: List[Any] = [filial, periodo.data_ini, periodo.data_fim]
+    params_d: List[Any] = [filial, periodo.data_ini, periodo.data_fim]
+
+    if codigo:
+        where.append("t.subgrupo=%s")
+        params_c.append(codigo)
+        params_d.append(codigo)
+
+    w = " AND ".join(where)
+
+    # COUNT
+    qcount = (
+        f"SELECT COUNT(*) FROM ("
+        f"  SELECT t.subgrupo "
+        f"  FROM view_analise_gerencial_produtos t "
+        f"  WHERE {w} "
+        f"  GROUP BY t.subgrupo"
+        f") sub"
+    )
+
+    # DATA
+    qdata = (
+        f"SELECT "
+        f"  t.subgrupo AS chave, "
+        f"  MAX(s.descricao) AS rotulo, "
+        f"  ROUND(SUM(t.totalVenda), 2) AS venda, "
+        f"  ROUND(SUM(t.quantidadeVendas), 2) AS itens, "
+        f"  COUNT(DISTINCT t.codigo) AS produtos_distintos "
+        f"FROM view_analise_gerencial_produtos t "
+        f"LEFT JOIN view_11_subgrupos s ON s.codigo=t.subgrupo "
+        f"WHERE {w} "
+        f"GROUP BY t.subgrupo "
+        f"ORDER BY venda DESC"
+    )
+
+    # Adiciona LIMIT conforme lógica
+    if codigo:
+        qdata += " LIMIT 1"
+        params_tail = tuple(params_d)
+    elif top is not None:
+        qdata += " LIMIT %s"
+        params_tail = tuple([*params_d, top])
+    else:
+        qdata += " LIMIT %s OFFSET %s"
+        params_tail = tuple([*params_d, limit, offset])
+
+    logger.info(f"📊 VENDAS/SUBGRUPO - SQL: {qdata} | PARAMS: {params_tail}")
+
+    with conn.cursor() as cur:
+        cur.execute(qdata, params_tail)
+        data = rows_to_dicts(cur)
+
+    if codigo or top is not None:
+        total = len(data)
+        page = Page(total=total, limit=total or 1, offset=0, pages=1)
+        return PagedResponse(page=page, data=data)
+
+    with conn.cursor() as cur:
+        cur.execute(qcount, tuple(params_c))
+        total = (cur.fetchone() or [0])[0] or 0
+
+    return PagedResponse(page=Page(**paginate(total, limit, offset)), data=data)
 
 # ======================== PRODUTOS ========================
 @app.get("/produtos/sem-movimento", response_model=PagedResponse, tags=["Produtos"])
